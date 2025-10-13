@@ -337,12 +337,12 @@ class ChatSession:
         
         tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
         
-        error_analysis_prompt = f"""The tool execution failed. Here's what happened:
+        error_analysis_prompt = f"""TOOL EXECUTION ERROR - ANALYSIS REQUIRED
 
 Original tool call:
 {json.dumps(original_tool_call, indent=2)}
 
-Error: {error_message}
+Error message: {error_message}
 
 Previous failed attempts:
 {json.dumps(error_history, indent=2)}
@@ -350,14 +350,18 @@ Previous failed attempts:
 Available tools:
 {tools_description}
 
-Analyze the error and suggest a corrected tool call. Consider:
+YOUR TASK: Analyze the error and provide a CORRECTED tool call (not a response to the user).
+
+Consider:
 1. Are the argument names correct?
 2. Are the argument values in the right format?
 3. Are all required arguments provided?
-4. Should you try a different tool?
-5. Is the user's request achievable with available tools?
+4. Does the error suggest a different approach?
+5. Is the request achievable with available tools?
 
-If you can fix it, respond with ONLY a JSON object:
+RESPOND WITH ONE OF THESE:
+
+Option A - If you can fix it:
 {{
     "tool": "corrected-tool-name",
     "arguments": {{
@@ -365,11 +369,13 @@ If you can fix it, respond with ONLY a JSON object:
     }}
 }}
 
-If the error is unfixable or the request is impossible with available tools, respond with:
-{{"unfixable": true, "reason": "explanation"}}"""
+Option B - If unfixable:
+{{"unfixable": true, "reason": "clear explanation why it cannot be fixed"}}
 
-        # Create a temporary message context for error analysis
-        analysis_messages = conversation_context[-3:] + [  # Last 3 messages for context
+IMPORTANT: Only respond with JSON, nothing else."""
+
+        # Create a fresh context for error analysis (not part of main conversation)
+        analysis_messages = [
             {
                 "role": "system",
                 "content": error_analysis_prompt
@@ -378,7 +384,7 @@ If the error is unfixable or the request is impossible with available tools, res
         
         try:
             llm_response = self.llm_client.get_response(analysis_messages)
-            logging.info(f"LLM analysis: {llm_response}")
+            logging.info(f"LLM error analysis: {llm_response}")
             
             fixed_call = json.loads(llm_response)
             
@@ -392,7 +398,7 @@ If the error is unfixable or the request is impossible with available tools, res
             return None
             
         except json.JSONDecodeError as e:
-            logging.error(f"LLM didn't return valid JSON: {e}")
+            logging.error(f"LLM didn't return valid JSON for error analysis: {e}")
             return None
         except Exception as e:
             logging.error(f"Error during LLM analysis: {e}")
@@ -463,21 +469,26 @@ Please try rephrasing your request or ask me to try a different approach."""
 
 {tools_description}
 
-Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.
+CRITICAL INSTRUCTIONS:
 
-IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
-{{
-    "tool": "tool-name",
-    "arguments": {{
-        "argument-name": "value"
-    }}
-}}
+1. WHEN TO USE TOOLS (Initial user query only):
+   - If you need to use a tool, respond with ONLY a JSON object (no other text):
+   {{
+       "tool": "tool-name",
+       "arguments": {{
+           "argument-name": "value"
+       }}
+   }}
 
-After receiving a tool's response:
-1. If it starts with "SUCCESS:", transform the data into a natural, conversational response
-2. If it starts with "FINAL_FAILURE:", acknowledge the failure empathetically and suggest alternatives
-3. Keep responses concise but informative
-4. Focus on the most relevant information
+2. WHEN TO GIVE NATURAL RESPONSES (After tool results):
+   - After you receive a tool execution result (marked as "system" role message)
+   - Transform the raw data into clear, conversational language
+   - NEVER return another JSON tool call after receiving tool results
+   - Present data in a readable format (bullet points, tables, or prose)
+   - If result starts with "SUCCESS:", extract and present the actual data
+   - If result starts with "FINAL_FAILURE:", empathetically explain what went wrong
+
+3. If no tool is needed for a query, reply directly in natural language.
 
 Please use only the tools that are explicitly defined above."""
 
@@ -512,10 +523,28 @@ Please use only the tools that are explicitly defined above."""
                     if result != llm_response:
                         # Tool was executed
                         messages.append({"role": "assistant", "content": llm_response})
-                        messages.append({"role": "system", "content": result})
+                        
+                        # Add tool result as system message
+                        messages.append({"role": "system", "content": f"[TOOL EXECUTION RESULT - Convert this to natural language for the user]\n{result}"})
                         
                         # Get final natural language response
                         final_response = self.llm_client.get_response(messages)
+                        
+                        # Ensure it's not another tool call
+                        try:
+                            parsed = json.loads(final_response)
+                            if "tool" in parsed and "arguments" in parsed:
+                                logging.warning("LLM returned another tool call instead of natural response. Forcing conversion...")
+                                
+                                # Force a natural response
+                                conversion_messages = messages + [
+                                    {"role": "assistant", "content": final_response},
+                                    {"role": "system", "content": "DO NOT return JSON. Provide a natural language response to the user explaining the results in plain English. Present the data clearly."}
+                                ]
+                                final_response = self.llm_client.get_response(conversion_messages)
+                        except json.JSONDecodeError:
+                            pass  # Good, it's not JSON
+                        
                         print(f"\n🤖 Assistant: {final_response}\n")
                         messages.append({"role": "assistant", "content": final_response})
                     else:
