@@ -1,12 +1,20 @@
 {
   "mcpServers": {
-    "sqlite": {
-      "command": "uvx",
-      "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
-    },
-    "puppeteer": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+    "MongoDB": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-e",
+        "MDB_MCP_CONNECTION_STRING",
+        "-e",
+        "MDB_MCP_READ_ONLY=true",
+        "mongodb/mongodb-mcp-server:latest"
+      ],
+      "env": {
+        "MDB_MCP_CONNECTION_STRING": "mongodb+srv://areyyaarshashwat_db_user:ss612@cluster0.wv0ibjw.mongodb.net/"
+      }
     }
   }
 }
