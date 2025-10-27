@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import shutil
+import re
 from typing import Dict, List, Optional, Any
+from enum import Enum
 
 import requests
 from dotenv import load_dotenv
@@ -14,13 +16,38 @@ from mcp.client.stdio import stdio_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+class LLMProvider(Enum):
+    """Enum for LLM providers."""
+    OPENAI = "openai"
+    GEMINI = "gemini"
+
+
 class Configuration:
     """Manages configuration and environment variables for the MCP client."""
 
     def __init__(self) -> None:
         """Initialize configuration with environment variables."""
         self.load_env()
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        
+        # Determine which LLM provider to use
+        self.llm_provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+        
+        if self.llm_provider == "openai":
+            self.api_key = os.getenv("OPENAI_API_KEY")
+            if not self.api_key:
+                raise ValueError("OPENAI_API_KEY not found in environment variables")
+        elif self.llm_provider == "gemini":
+            self.api_key = os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("GOOGLE_API_KEY not found in environment variables")
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
+        
+        # Optional: Set default model names
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
+        
+        logging.info(f"Using LLM Provider: {self.llm_provider}")
 
     @staticmethod
     def load_env() -> None:
@@ -36,9 +63,19 @@ class Configuration:
     @property
     def llm_api_key(self) -> str:
         """Get the LLM API key."""
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY not found in environment variables")
         return self.api_key
+    
+    def get_llm_provider(self) -> str:
+        """Get the LLM provider."""
+        return self.llm_provider
+    
+    def get_model_name(self) -> str:
+        """Get the appropriate model name based on provider."""
+        if self.llm_provider == "openai":
+            return self.openai_model
+        elif self.llm_provider == "gemini":
+            return self.gemini_model
+        return ""
 
 
 class Server:
@@ -181,11 +218,38 @@ Arguments:
 class LLMClient:
     """Manages communication with the LLM provider."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, provider: str, model_name: str) -> None:
         self.api_key: str = api_key
+        self.provider: str = provider
+        self.model_name: str = model_name
 
-    def get_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get a response from the LLM."""
+    def _convert_messages_for_gemini(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """Convert OpenAI-style messages to Gemini format."""
+        gemini_messages = []
+        
+        # Combine system messages with the first user message for Gemini
+        system_content = ""
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content += msg["content"] + "\n\n"
+            elif msg["role"] == "user":
+                content = system_content + msg["content"] if system_content else msg["content"]
+                gemini_messages.append({
+                    "role": "user",
+                    "parts": [{"text": content}]
+                })
+                system_content = ""  # Reset after using
+            elif msg["role"] == "assistant":
+                gemini_messages.append({
+                    "role": "model",
+                    "parts": [{"text": msg["content"]}]
+                })
+        
+        return gemini_messages
+
+    def get_response_openai(self, messages: List[Dict[str, str]]) -> str:
+        """Get a response from OpenAI."""
         url = "https://api.openai.com/v1/chat/completions"
 
         headers = {
@@ -194,11 +258,10 @@ class LLMClient:
         }
         payload = {
             "messages": messages,
-            "model": "gpt-5-nano",
-            "temperature": 1,
+            "model": self.model_name,
+            "temperature": 0.7,
             "top_p": 1,
-            "stream": False,
-            "stop": None
+            "stream": False
         }
         
         try:
@@ -208,7 +271,7 @@ class LLMClient:
             return data['choices'][0]['message']['content']
             
         except requests.exceptions.RequestException as e:
-            error_message = f"Error getting LLM response: {str(e)}"
+            error_message = f"Error getting OpenAI response: {str(e)}"
             logging.error(error_message)
             
             if e.response is not None:
@@ -217,6 +280,63 @@ class LLMClient:
                 logging.error(f"Response details: {e.response.text}")
                 
             return f"I encountered an error: {error_message}. Please try again or rephrase your request."
+
+    def get_response_gemini(self, messages: List[Dict[str, str]]) -> str:
+        """Get a response from Google Gemini."""
+        # Correct API endpoint for Gemini
+        base_url = "https://generativelanguage.googleapis.com/v1beta"
+        url = f"{base_url}/models/{self.model_name}:generateContent?key={self.api_key}"
+        
+        # Convert messages to Gemini format
+        gemini_messages = self._convert_messages_for_gemini(messages)
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "contents": gemini_messages,
+            "generationConfig": {
+                "temperature": 0.7,
+                "topP": 1.0,
+                "maxOutputTokens": 2048,
+            }
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract text from Gemini response
+            if "candidates" in data and len(data["candidates"]) > 0:
+                candidate = data["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    parts = candidate["content"]["parts"]
+                    if len(parts) > 0 and "text" in parts[0]:
+                        return parts[0]["text"]
+            
+            return "No response generated from Gemini."
+            
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error getting Gemini response: {str(e)}"
+            logging.error(error_message)
+            
+            if e.response is not None:
+                status_code = e.response.status_code
+                logging.error(f"Status code: {status_code}")
+                logging.error(f"Response details: {e.response.text}")
+                
+            return f"I encountered an error: {error_message}. Please try again or rephrase your request."
+
+    def get_response(self, messages: List[Dict[str, str]]) -> str:
+        """Get a response from the configured LLM provider."""
+        if self.provider == "openai":
+            return self.get_response_openai(messages)
+        elif self.provider == "gemini":
+            return self.get_response_gemini(messages)
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}")
 
 
 class ChatSession:
@@ -260,7 +380,7 @@ class ChatSession:
         while retry_count < self.max_retries:
             try:
                 logging.info(f"Attempt {retry_count + 1}/{self.max_retries}: Executing tool '{tool_call['tool']}'")
-                logging.info(f"With arguments: {tool_call['arguments']}")
+                logging.info(f"With arguments: {json.dumps(tool_call['arguments'], indent=2)}")
                 
                 # Find the server with this tool and execute
                 for server in self.servers:
@@ -276,6 +396,10 @@ class ChatSession:
                             total = result['total']
                             logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
                         
+                        if result.isError == True or (result.content and "error" in result.content):
+                            logging.error(f"Error on attempt {retry_count + 1}: {result}")
+                            return f"ERROR: {result}"
+
                         logging.info(f"✓ Tool executed successfully on attempt {retry_count + 1}")
                         return f"SUCCESS: {result}"
                 
@@ -297,8 +421,8 @@ class ChatSession:
                     logging.error(f"All {self.max_retries} attempts failed")
                     return self._format_final_failure(tool_call, error_history)
                 
-                # Ask LLM to analyze the error and suggest a fix
-                logging.info(f"Asking LLM to analyze error and retry...")
+                # Ask LLM to analyze the error and suggest a fix AUTOMATICALLY
+                logging.info(f"🔄 Auto-retry: Asking LLM to analyze error and fix automatically...")
                 new_tool_call = await self._ask_llm_to_fix_error(
                     tool_call, 
                     error_msg, 
@@ -308,10 +432,11 @@ class ChatSession:
                 
                 if new_tool_call:
                     tool_call = new_tool_call
-                    logging.info(f"LLM suggested new approach: {tool_call}")
-                    await asyncio.sleep(1)  # Brief delay before retry
+                    logging.info(f"✓ LLM auto-corrected the approach. Retrying immediately...")
+                    await asyncio.sleep(0.5)  # Brief delay before retry
+                    # Loop continues automatically - no user interaction needed
                 else:
-                    logging.error("LLM couldn't suggest a fix")
+                    logging.error("LLM couldn't auto-fix the error")
                     return self._format_final_failure(tool_call, error_history)
         
         return self._format_final_failure(tool_call, error_history)
@@ -337,7 +462,9 @@ class ChatSession:
         
         tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
         
-        error_analysis_prompt = f"""TOOL EXECUTION ERROR - ANALYSIS REQUIRED
+        error_analysis_prompt = f"""TOOL EXECUTION ERROR - AUTO-FIX REQUIRED
+
+You are an automated error correction system. A tool call failed and you must fix it automatically.
 
 Original tool call:
 {json.dumps(original_tool_call, indent=2)}
@@ -350,18 +477,18 @@ Previous failed attempts:
 Available tools:
 {tools_description}
 
-YOUR TASK: Analyze the error and provide a CORRECTED tool call (not a response to the user).
+YOUR TASK: Analyze the error and provide a CORRECTED tool call that will work.
 
-Consider:
-1. Are the argument names correct?
-2. Are the argument values in the right format?
-3. Are all required arguments provided?
-4. Does the error suggest a different approach?
-5. Is the request achievable with available tools?
+Common fixes:
+1. MongoDB errors with $toDouble: Wrap in $cond to check if value is numeric first
+2. Empty string errors: Add validation before conversion
+3. Wrong field names: Check the actual schema
+4. Pipeline errors: Simplify or reorder stages
+5. Type conversion errors: Use $ifNull and type checking
 
-RESPOND WITH ONE OF THESE:
+YOU MUST respond with ONLY a JSON object (no explanations, no questions, no text):
 
-Option A - If you can fix it:
+If fixable:
 {{
     "tool": "corrected-tool-name",
     "arguments": {{
@@ -369,10 +496,15 @@ Option A - If you can fix it:
     }}
 }}
 
-Option B - If unfixable:
-{{"unfixable": true, "reason": "clear explanation why it cannot be fixed"}}
+If unfixable after {len(error_history)} attempts:
+{{"unfixable": true, "reason": "brief technical reason"}}
 
-IMPORTANT: Only respond with JSON, nothing else."""
+CRITICAL: 
+- DO NOT ask questions
+- DO NOT request confirmation
+- DO NOT explain your changes
+- ONLY return the JSON object
+- This is automatic - no human will see this"""
 
         # Create a fresh context for error analysis (not part of main conversation)
         analysis_messages = [
@@ -424,26 +556,62 @@ I've tried different approaches but couldn't resolve the issue. This might be be
 
 Please try rephrasing your request or ask me to try a different approach."""
 
+    def extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Extract JSON from LLM response, handling markdown code blocks."""
+        # Try to parse as plain JSON first
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        
+        # Try to extract JSON from markdown code block
+        # Pattern matches ```json ... ``` or just ``` ... ```
+        json_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+        matches = re.findall(json_pattern, response, re.DOTALL)
+        
+        if matches:
+            for match in matches:
+                try:
+                    return json.loads(match.strip())
+                except json.JSONDecodeError:
+                    continue
+        
+        # Try to find JSON object without code blocks
+        # Look for content between first { and last }
+        try:
+            first_brace = response.find('{')
+            last_brace = response.rfind('}')
+            if first_brace != -1 and last_brace != -1:
+                json_str = response[first_brace:last_brace + 1]
+                return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        
+        return None
+
     async def process_llm_response(
         self, 
         llm_response: str,
         conversation_context: List[Dict[str, str]]
-    ) -> str:
-        """Process the LLM response and execute tools if needed."""
-        try:
-            tool_call = json.loads(llm_response)
-            if "tool" in tool_call and "arguments" in tool_call:
-                # Use intelligent retry logic
-                result = await self.execute_tool_with_intelligent_retry(
-                    tool_call,
-                    conversation_context
-                )
-                return result
-            
-            return llm_response
-            
-        except json.JSONDecodeError:
-            return llm_response
+    ) -> tuple[bool, str]:
+        """Process the LLM response and execute tools if needed.
+        
+        Returns:
+            (is_tool_call, result) tuple
+        """
+        # Try to extract JSON from the response
+        tool_call = self.extract_json_from_response(llm_response)
+        
+        if tool_call and "tool" in tool_call and "arguments" in tool_call:
+            # Use intelligent retry logic
+            result = await self.execute_tool_with_intelligent_retry(
+                tool_call,
+                conversation_context
+            )
+            return True, result
+        
+        # Not a tool call, return the original response
+        return False, llm_response
 
     async def start(self) -> None:
         """Main chat session handler."""
@@ -452,8 +620,9 @@ Please try rephrasing your request or ask me to try a different approach."""
             for server in self.servers:
                 try:
                     await server.initialize()
+                    logging.info(f"✓ Successfully initialized server: {server.name}")
                 except Exception as e:
-                    logging.error(f"Failed to initialize server: {e}")
+                    logging.error(f"Failed to initialize server {server.name}: {e}")
                     await self.cleanup_servers()
                     return
             
@@ -462,6 +631,7 @@ Please try rephrasing your request or ask me to try a different approach."""
             for server in self.servers:
                 tools = await server.list_tools()
                 all_tools.extend(tools)
+                logging.info(f"Server {server.name} provides {len(tools)} tools")
             
             tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
             
@@ -472,13 +642,16 @@ Please try rephrasing your request or ask me to try a different approach."""
 CRITICAL INSTRUCTIONS:
 
 1. WHEN TO USE TOOLS (Initial user query only):
-   - If you need to use a tool, respond with ONLY a JSON object (no other text):
+   - If you need to use a tool, respond with ONLY a JSON object:
    {{
        "tool": "tool-name",
        "arguments": {{
            "argument-name": "value"
        }}
    }}
+   - DO NOT wrap the JSON in markdown code blocks (no ```)
+   - DO NOT add any text before or after the JSON
+   - The response must be valid JSON that can be parsed directly
 
 2. WHEN TO GIVE NATURAL RESPONSES (After tool results):
    - After you receive a tool execution result (marked as "system" role message)
@@ -500,6 +673,8 @@ Please use only the tools that are explicitly defined above."""
             ]
 
             print("\n🤖 Chat session started! Type 'quit' or 'exit' to end.\n")
+            print(f"📡 Using {self.llm_client.provider.upper()} with model: {self.llm_client.model_name}\n")
+            print(f"📦 Loaded {len(all_tools)} tools from {len(self.servers)} server(s)\n")
 
             while True:
                 try:
@@ -517,47 +692,60 @@ Please use only the tools that are explicitly defined above."""
                     llm_response = self.llm_client.get_response(messages)
                     logging.info(f"\nLLM Response: {llm_response}")
 
-                    # Process response (may trigger tool execution with retries)
-                    result = await self.process_llm_response(llm_response, messages)
-                    
-                    if result != llm_response:
-                        # Tool was executed
+                    # Process the response and check if it's a tool call
+                    is_tool_call, result = await self.process_llm_response(llm_response, messages)
+
+                    logging.info(f"is_tool_call: {is_tool_call}")
+                    logging.info(f"Detected tool call: {'Yes' if is_tool_call else 'No'}")
+
+                    if is_tool_call:
+                        # Tool was executed - DON'T show JSON to user
+                        print("\n🔧 Executing tool...")
+                        logging.info(f"Tool execution result: {result[:500] if len(result) > 500 else result}...")
+                        
+                        # Add the tool call to message history
                         messages.append({"role": "assistant", "content": llm_response})
                         
-                        # Add tool result as system message
-                        messages.append({"role": "system", "content": f"[TOOL EXECUTION RESULT - Convert this to natural language for the user]\n{result}"})
+                        # Add tool result as system message with clear instruction
+                        messages.append({"role": "system", "content": f"""[AUTOMATIC TOOL EXECUTION COMPLETED]
+
+Result: {result}
+
+INSTRUCTION: Convert the above result into a clear, natural language response for the user. 
+- DO NOT return another tool call
+- DO NOT ask for confirmation to retry
+- Present the data in a readable format
+- If it's a SUCCESS, extract and format the data nicely
+- If it's a FAILURE, explain what went wrong sympathetically"""})
                         
                         # Get final natural language response
                         final_response = self.llm_client.get_response(messages)
                         
                         # Ensure it's not another tool call
-                        try:
-                            parsed = json.loads(final_response)
-                            if "tool" in parsed and "arguments" in parsed:
-                                logging.warning("LLM returned another tool call instead of natural response. Forcing conversion...")
-                                
-                                # Force a natural response
-                                conversion_messages = messages + [
-                                    {"role": "assistant", "content": final_response},
-                                    {"role": "system", "content": "DO NOT return JSON. Provide a natural language response to the user explaining the results in plain English. Present the data clearly."}
-                                ]
-                                final_response = self.llm_client.get_response(conversion_messages)
-                        except json.JSONDecodeError:
-                            pass  # Good, it's not JSON
+                        parsed_final = self.extract_json_from_response(final_response)
+                        if parsed_final and "tool" in parsed_final and "arguments" in parsed_final:
+                            logging.warning("LLM returned another tool call instead of natural response. Forcing conversion...")
+                            # Force a natural response with stronger instruction
+                            conversion_messages = messages + [
+                                {"role": "assistant", "content": final_response},
+                                {"role": "system", "content": "CRITICAL: You MUST respond in plain English sentences. NO JSON. NO tool calls. Just explain the results naturally to the user."}
+                            ]
+                            final_response = self.llm_client.get_response(conversion_messages)
                         
                         print(f"\n🤖 Assistant: {final_response}\n")
                         messages.append({"role": "assistant", "content": final_response})
                     else:
-                        # Direct response
-                        print(f"\n🤖 Assistant: {llm_response}\n")
-                        messages.append({"role": "assistant", "content": llm_response})
+                        # Direct response (not a tool call) - result contains the original response
+                        print(f"\n🤖 Assistant: {result}\n")
+                        messages.append({"role": "assistant", "content": result})
 
                 except KeyboardInterrupt:
                     logging.info("\n\nInterrupted by user. Exiting...")
                     break
                 except Exception as e:
-                    logging.error(f"Error in chat loop: {e}")
+                    logging.error(f"Error in chat loop: {e}", exc_info=True)
                     print(f"\n❌ An error occurred: {e}\n")
+                    print("Continuing chat session...\n")
         
         finally:
             await self.cleanup_servers()
@@ -568,7 +756,13 @@ async def main() -> None:
     config = Configuration()
     server_config = config.load_config('servers_config.json')
     servers = [Server(name, srv_config) for name, srv_config in server_config['mcpServers'].items()]
-    llm_client = LLMClient(config.llm_api_key)
+    
+    # Create LLM client with provider info
+    llm_client = LLMClient(
+        api_key=config.llm_api_key,
+        provider=config.get_llm_provider(),
+        model_name=config.get_model_name()
+    )
     
     # You can configure max_retries here (default is 3)
     chat_session = ChatSession(servers, llm_client, max_retries=3)

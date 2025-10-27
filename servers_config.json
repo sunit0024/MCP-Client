@@ -1,19 +1,26 @@
 {
   "mcpServers": {
-    "MongoDB": {
+   "database": {
+      "command": "node",
+      "args": ["C:\\Users\\sunit\\Documents\\database-mcp-server\\build\\index.js"],
+      "env": {
+        "JAVA_SERVICE_URL": "http://localhost:8315",
+        "API_KEY": "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdzdMZjdadnJoWnRxYlFra3BlVGlSWUx4V1dGQUNBYkdIWXd2N3hZOEo0In0.eyJleHAiOjE3NjE2NDg2MTIsImlhdCI6MTc2MTU2MjIxMiwianRpIjoiNDU4OWRkZjAtNTE4MS00YzQwLWIyMGEtMDI1NjI5ZDQyNWRkIiwiaXNzIjoiaHR0cHM6Ly9kZXYtbG9naW4uY2FyZ29lcy5jb20vYXV0aC9yZWFsbXMvZHR3b3JsZCIsInN1YiI6IjdmNmI1MjcyLTFjNWItNGQyNy1iNDY0LTkwNDQ2OTZkNWQ5ZiIsInR5cCI6IkJlYXJlciIsImF6cCI6IkVVIiwic2Vzc2lvbl9zdGF0ZSI6ImQ3OGVhYjA5LTJkZDctNGVhNi1hMWQ1LTg3MDYzMjZmZDcxNiIsInNjb3BlIjoiZW1haWwgY2xpZW50LXJlZ2lzdHJhdGlvbiBvcGVuaWQiLCJzaWQiOiJkNzhlYWIwOS0yZGQ3LTRlYTYtYTFkNS04NzA2MzI2ZmQ3MTYiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiY3JlYXRlZFRpbWVzdGFtcCI6MTY1MTI0Mzg5NDg4Mywicm9sZXMiOlsiZGVmYXVsdC1yb2xlcy1kdHdvcmxkIiwib2ZmbGluZV9hY2Nlc3MiLCJ1bWFfYXV0aG9yaXphdGlvbiJdLCJpbmR1c3RyeV90eXBlIjpbIkJSSyJdLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJ0cmFuc2l0YWRtaW4iLCJnaXZlbl9uYW1lIjoidHJhbnNpdGFkbWluIiwibG9jYWxlIjoiZW4iLCJjb250YWN0X251bWJlciI6IjQzMjEyMzQ1NjciLCJidXNpbmVzc190eXBlIjoiQ1UiLCJuYW1lIjoidHJhbnNpdGFkbWluIHQiLCJjdXJyZW5jeSI6IkdCUCIsInJlYWxtIjoiZHR3b3JsZCIsImZhbWlseV9uYW1lIjoidCIsImVtYWlsIjoiY25zLWRldi50cmFuc2l0YWRtaW5AeW9wbWFpbC5jb20iLCJjb250YWN0X251bWJlcl9jb3VudHJ5X2NvZGUiOiIrNDQifQ.EU9CdnbxOmSRRjyGVfSwnDgYXDJVqVm37kbnJG5WACoy8F9FEX2M3Vv7lI53calPUPVgEOerkB-_NXaXDYD4Tp6t-m6WH9Budg8GOqj6uCc-nBPgGn5pFn8f7Q_xz9M4hvj5m5cyQYigUEJqu6RDqy42-QGfWkEG_OJmy2onSWEaaGGcjg3xqa4_y-Q-ZDrQiW6CSoODuLlJIPr2LAwI7Th4XCXpRoU9AioGmVEPLhTy1Cksi96jvyD8v9FzIDIIRKeOAhE2MGn1xV8Wskwb0hSzQNa5tZiEyw7vePEinbXdNJU_Jd01UNEwJhhAcRWZQRJ9LKL6gaJIvnLCJf56ow"
+      }
+    },
+    "postgres": {
       "command": "docker",
       "args": [
         "run",
-        "--rm",
         "-i",
+        "--rm",
         "-e",
-        "MDB_MCP_CONNECTION_STRING",
-        "-e",
-        "MDB_MCP_READ_ONLY=true",
-        "mongodb/mongodb-mcp-server:latest"
+        "DATABASE_URI",
+        "crystaldba/postgres-mcp",
+        "--access-mode=unrestricted"
       ],
       "env": {
-        "MDB_MCP_CONNECTION_STRING": "mongodb+srv://areyyaarshashwat_db_user:ss612@cluster0.wv0ibjw.mongodb.net/"
+        "DATABASE_URI": "postgresql://postgres:1234@localhost:5432/postgres"
       }
     }
   }
