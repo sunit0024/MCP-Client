@@ -227,24 +227,43 @@ class LLMClient:
         """Convert OpenAI-style messages to Gemini format."""
         gemini_messages = []
         
-        # Combine system messages with the first user message for Gemini
-        system_content = ""
+        # Track system content to prepend to next user message
+        pending_system_content = ""
         
         for msg in messages:
             if msg["role"] == "system":
-                system_content += msg["content"] + "\n\n"
+                # Accumulate system messages to prepend to next user message
+                pending_system_content += msg["content"] + "\n\n"
             elif msg["role"] == "user":
-                content = system_content + msg["content"] if system_content else msg["content"]
+                # Combine any pending system content with user message
+                content = pending_system_content + msg["content"] if pending_system_content else msg["content"]
                 gemini_messages.append({
                     "role": "user",
                     "parts": [{"text": content}]
                 })
-                system_content = ""  # Reset after using
+                pending_system_content = ""  # Reset after using
             elif msg["role"] == "assistant":
+                # If there's pending system content and no user message follows,
+                # add it as context to the assistant message
+                if pending_system_content and gemini_messages:
+                    # Add as a user message for context
+                    gemini_messages.append({
+                        "role": "user", 
+                        "parts": [{"text": pending_system_content.strip()}]
+                    })
+                    pending_system_content = ""
+                
                 gemini_messages.append({
                     "role": "model",
                     "parts": [{"text": msg["content"]}]
                 })
+        
+        # Handle any remaining system content at the end
+        if pending_system_content and gemini_messages:
+            gemini_messages.append({
+                "role": "user",
+                "parts": [{"text": pending_system_content.strip()}]
+            })
         
         return gemini_messages
 
@@ -706,17 +725,26 @@ Please use only the tools that are explicitly defined above."""
                         # Add the tool call to message history
                         messages.append({"role": "assistant", "content": llm_response})
                         
-                        # Add tool result as system message with clear instruction
-                        messages.append({"role": "system", "content": f"""[AUTOMATIC TOOL EXECUTION COMPLETED]
+                        # Extract the actual content from the result for cleaner processing
+                        clean_result = result
+                        if "SUCCESS:" in result and "content=" in result:
+                            # Extract just the text content from the result
+                            try:
+                                import re
+                                text_match = re.search(r"text='([^']*)'", result)
+                                if text_match:
+                                    clean_result = text_match.group(1).replace('\\n', '\n')
+                            except:
+                                pass
+                        
+                        # Add tool result as a user message for Gemini (works better than system)
+                        # This makes it clearer for Gemini to process
+                        messages.append({"role": "assistant", "content": llm_response})
+                        messages.append({"role": "user", "content": f"""The tool execution completed successfully. Here's the result:
 
-Result: {result}
+{clean_result}
 
-INSTRUCTION: Convert the above result into a clear, natural language response for the user. 
-- DO NOT return another tool call
-- DO NOT ask for confirmation to retry
-- Present the data in a readable format
-- If it's a SUCCESS, extract and format the data nicely
-- If it's a FAILURE, explain what went wrong sympathetically"""})
+Please explain this result to me in clear, natural language. What does this mean?"""})
                         
                         # Get final natural language response
                         final_response = self.llm_client.get_response(messages)
