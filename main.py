@@ -361,10 +361,11 @@ class LLMClient:
 class ChatSession:
     """Orchestrates the interaction between user, LLM, and tools."""
 
-    def __init__(self, servers: List[Server], llm_client: LLMClient, max_retries: int = 3) -> None:
+    def __init__(self, servers: List[Server], llm_client: LLMClient, max_retries: int = 3, max_tool_calls: int = 10) -> None:
         self.servers: List[Server] = servers
         self.llm_client: LLMClient = llm_client
         self.max_retries: int = max_retries
+        self.max_tool_calls: int = max_tool_calls  # Prevent infinite loops
 
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
@@ -608,29 +609,90 @@ Please try rephrasing your request or ask me to try a different approach."""
         
         return None
 
-    async def process_llm_response(
+    def _clean_tool_result(self, result: str) -> str:
+        """Extract clean content from tool result."""
+        if "SUCCESS:" in result and "content=" in result:
+            try:
+                text_match = re.search(r"text='([^']*)'", result)
+                if text_match:
+                    return text_match.group(1).replace('\\n', '\n')
+            except:
+                pass
+        return result
+
+    async def process_user_request_with_sequential_tools(
         self, 
-        llm_response: str,
-        conversation_context: List[Dict[str, str]]
-    ) -> tuple[bool, str]:
-        """Process the LLM response and execute tools if needed.
-        
-        Returns:
-            (is_tool_call, result) tuple
+        user_input: str,
+        messages: List[Dict[str, str]]
+    ) -> str:
         """
-        # Try to extract JSON from the response
-        tool_call = self.extract_json_from_response(llm_response)
+        Process a user request that may require multiple sequential tool calls.
         
-        if tool_call and "tool" in tool_call and "arguments" in tool_call:
-            # Use intelligent retry logic
-            result = await self.execute_tool_with_intelligent_retry(
-                tool_call,
-                conversation_context
-            )
-            return True, result
+        This method implements an agent loop that:
+        1. Gets LLM response
+        2. If it's a tool call, executes it and feeds result back to LLM
+        3. Repeats until LLM gives a final natural language response
+        4. Returns the final response to user
         
-        # Not a tool call, return the original response
-        return False, llm_response
+        Args:
+            user_input: The user's query
+            messages: Conversation history
+            
+        Returns:
+            Final natural language response
+        """
+        tool_call_count = 0
+        
+        while tool_call_count < self.max_tool_calls:
+            # Get LLM response
+            llm_response = self.llm_client.get_response(messages)
+            logging.info(f"\n{'='*60}")
+            logging.info(f"LLM Response #{tool_call_count + 1}: {llm_response[:200]}...")
+            
+            # Check if it's a tool call
+            tool_call = self.extract_json_from_response(llm_response)
+            
+            if not tool_call or "tool" not in tool_call or "arguments" not in tool_call:
+                # Natural language response - we're done!
+                logging.info("✓ LLM provided final natural language response")
+                return llm_response
+            
+            # It's a tool call - execute it
+            tool_call_count += 1
+            logging.info(f"🔧 Tool call #{tool_call_count}: {tool_call['tool']}")
+            print(f"\n🔧 Executing tool #{tool_call_count}: {tool_call['tool']}...")
+            
+            # Execute the tool with retry logic
+            result = await self.execute_tool_with_intelligent_retry(tool_call, messages)
+            
+            # Check for failure
+            if result.startswith("FINAL_FAILURE:"):
+                logging.error("Tool execution failed after retries")
+                return result
+            
+            # Clean the result for better LLM processing
+            clean_result = self._clean_tool_result(result)
+            
+            # Add tool call and result to conversation history
+            messages.append({"role": "assistant", "content": llm_response})
+            messages.append({
+                "role": "user", 
+                "content": f"""Tool execution completed. Result:
+
+{clean_result}
+
+Based on this result, decide:
+1. If you need to call another tool to complete the user's goal, respond with the next tool call in JSON format
+2. If the goal is complete, provide a natural language response explaining the results to the user
+
+Remember the original goal: {user_input}"""
+            })
+            
+            logging.info(f"✓ Tool result added to context. Continuing agent loop...")
+        
+        # Safety check: too many tool calls
+        logging.warning(f"⚠️ Reached maximum tool calls limit ({self.max_tool_calls})")
+        return f"I've made {self.max_tool_calls} tool calls but haven't completed the task. The task might be too complex or require a different approach. Here's what I found so far based on the tool results."
 
     async def start(self) -> None:
         """Main chat session handler."""
@@ -654,35 +716,46 @@ Please try rephrasing your request or ask me to try a different approach."""
             
             tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
             
-            system_message = f"""You are a helpful assistant with access to these tools: 
+            system_message = f"""You are an AI agent with access to tools that help you complete user requests. You can call multiple tools in sequence to achieve complex goals.
 
+AVAILABLE TOOLS:
 {tools_description}
 
-CRITICAL INSTRUCTIONS:
+CRITICAL INSTRUCTIONS FOR MULTI-STEP WORKFLOWS:
 
-1. WHEN TO USE TOOLS (Initial user query only):
-   - If you need to use a tool, respond with ONLY a JSON object:
+1. SEQUENTIAL TOOL EXECUTION:
+   - You can make MULTIPLE tool calls to complete a single user request
+   - After each tool execution, you'll receive the result
+   - Analyze the result and decide: do you need another tool call, or can you answer the user?
+   - Continue calling tools until you have all information needed to answer the user
+
+2. TOOL CALL FORMAT (when you need to call a tool):
+   - Respond with ONLY a JSON object:
    {{
        "tool": "tool-name",
        "arguments": {{
            "argument-name": "value"
        }}
    }}
-   - DO NOT wrap the JSON in markdown code blocks (no ```)
-   - DO NOT add any text before or after the JSON
-   - The response must be valid JSON that can be parsed directly
+   - NO markdown code blocks (no ```)
+   - NO explanatory text before or after the JSON
 
-2. WHEN TO GIVE NATURAL RESPONSES (After tool results):
-   - After you receive a tool execution result (marked as "system" role message)
-   - Transform the raw data into clear, conversational language
-   - NEVER return another JSON tool call after receiving tool results
-   - Present data in a readable format (bullet points, tables, or prose)
-   - If result starts with "SUCCESS:", extract and present the actual data
-   - If result starts with "FINAL_FAILURE:", empathetically explain what went wrong
+3. FINAL RESPONSE FORMAT (when you're done with tools):
+   - After gathering all needed information via tools
+   - Provide a clear, natural language response
+   - Summarize findings from all tool calls
+   - Answer the user's original question comprehensively
 
-3. If no tool is needed for a query, reply directly in natural language.
+4. PLANNING COMPLEX TASKS:
+   - Break down complex requests into sequential tool calls
+   - Example: "Show me customers who bought product X and their total spending"
+     → Call 1: Find customers who bought product X
+     → Call 2: Calculate total spending for those customers
+     → Final response: Summarize the results
 
-Please use only the tools that are explicitly defined above."""
+5. If no tool is needed for a query, respond directly in natural language.
+
+Remember: You are an autonomous agent. Make decisions about which tools to call and when to stop."""
 
             messages = [
                 {
@@ -691,9 +764,11 @@ Please use only the tools that are explicitly defined above."""
                 }
             ]
 
-            print("\n🤖 Chat session started! Type 'quit' or 'exit' to end.\n")
-            print(f"📡 Using {self.llm_client.provider.upper()} with model: {self.llm_client.model_name}\n")
-            print(f"📦 Loaded {len(all_tools)} tools from {len(self.servers)} server(s)\n")
+            print("\n🤖 Multi-step Agent Chat Session Started!")
+            print(f"📡 Using {self.llm_client.provider.upper()} with model: {self.llm_client.model_name}")
+            print(f"📦 Loaded {len(all_tools)} tools from {len(self.servers)} server(s)")
+            print(f"🔧 Max sequential tool calls per request: {self.max_tool_calls}")
+            print("\nType 'quit' or 'exit' to end the session.\n")
 
             while True:
                 try:
@@ -705,67 +780,20 @@ Please use only the tools that are explicitly defined above."""
                     if not user_input:
                         continue
 
+                    # Add user message to history
                     messages.append({"role": "user", "content": user_input})
                     
-                    # Get LLM response
-                    llm_response = self.llm_client.get_response(messages)
-                    logging.info(f"\nLLM Response: {llm_response}")
-
-                    # Process the response and check if it's a tool call
-                    is_tool_call, result = await self.process_llm_response(llm_response, messages)
-
-                    logging.info(f"is_tool_call: {is_tool_call}")
-                    logging.info(f"Detected tool call: {'Yes' if is_tool_call else 'No'}")
-
-                    if is_tool_call:
-                        # Tool was executed - DON'T show JSON to user
-                        print("\n🔧 Executing tool...")
-                        logging.info(f"Tool execution result: {result[:500] if len(result) > 500 else result}...")
-                        
-                        # Add the tool call to message history
-                        messages.append({"role": "assistant", "content": llm_response})
-                        
-                        # Extract the actual content from the result for cleaner processing
-                        clean_result = result
-                        if "SUCCESS:" in result and "content=" in result:
-                            # Extract just the text content from the result
-                            try:
-                                import re
-                                text_match = re.search(r"text='([^']*)'", result)
-                                if text_match:
-                                    clean_result = text_match.group(1).replace('\\n', '\n')
-                            except:
-                                pass
-                        
-                        # Add tool result as a user message for Gemini (works better than system)
-                        # This makes it clearer for Gemini to process
-                        messages.append({"role": "assistant", "content": llm_response})
-                        messages.append({"role": "user", "content": f"""The tool execution completed successfully. Here's the result:
-
-{clean_result}
-
-Please explain this result to me in clear, natural language. What does this mean?"""})
-                        
-                        # Get final natural language response
-                        final_response = self.llm_client.get_response(messages)
-                        
-                        # Ensure it's not another tool call
-                        parsed_final = self.extract_json_from_response(final_response)
-                        if parsed_final and "tool" in parsed_final and "arguments" in parsed_final:
-                            logging.warning("LLM returned another tool call instead of natural response. Forcing conversion...")
-                            # Force a natural response with stronger instruction
-                            conversion_messages = messages + [
-                                {"role": "assistant", "content": final_response},
-                                {"role": "system", "content": "CRITICAL: You MUST respond in plain English sentences. NO JSON. NO tool calls. Just explain the results naturally to the user."}
-                            ]
-                            final_response = self.llm_client.get_response(conversion_messages)
-                        
-                        print(f"\n🤖 Assistant: {final_response}\n")
-                        messages.append({"role": "assistant", "content": final_response})
-                    else:
-                        # Direct response (not a tool call) - result contains the original response
-                        print(f"\n🤖 Assistant: {result}\n")
-                        messages.append({"role": "assistant", "content": result})
+                    # Process request with sequential tool calling
+                    final_response = await self.process_user_request_with_sequential_tools(
+                        user_input, 
+                        messages
+                    )
+                    
+                    # Display final response to user
+                    print(f"\n🤖 Assistant: {final_response}\n")
+                    
+                    # Add final response to history
+                    messages.append({"role": "assistant", "content": final_response})
 
                 except KeyboardInterrupt:
                     logging.info("\n\nInterrupted by user. Exiting...")
@@ -792,8 +820,15 @@ async def main() -> None:
         model_name=config.get_model_name()
     )
     
-    # You can configure max_retries here (default is 3)
-    chat_session = ChatSession(servers, llm_client, max_retries=3)
+    # Configure max_retries and max_tool_calls
+    # max_retries: retry attempts per tool if it fails
+    # max_tool_calls: maximum sequential tool calls per user request
+    chat_session = ChatSession(
+        servers, 
+        llm_client, 
+        max_retries=3,
+        max_tool_calls=10  # Adjust based on your needs
+    )
     await chat_session.start()
 
 if __name__ == "__main__":
